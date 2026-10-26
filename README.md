@@ -46,7 +46,7 @@ Current limitations
 - The full team metrics and independent evaluation remain under development.
 Do not commit credentials or copyrighted article collections without checking permissions.
 
-
+```
 
 ## Version 2 — OVH gpt-oss-120b
 
