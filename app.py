@@ -1,4 +1,7 @@
 import json
+import os
+import time
+from urllib.parse import urlparse
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -6,8 +9,7 @@ import requests
 import streamlit as st
 
 
-MODEL = "hf.co/Qwen/Qwen2.5-7B-Instruct-GGUF:Q3_K_M"
-OLLAMA_URL = "http://localhost:11434/api/chat"
+APP_VERSION = "2.0"
 PROMPT_VERSION = "0.3"
 
 INSTRUCTIONS = """
@@ -207,6 +209,70 @@ def make_review_tables(result):
     )
 
 
+def safe_error(error):
+    # Do not display response bodies or request URLs: they can contain secrets.
+    if isinstance(error, requests.HTTPError):
+        status = error.response.status_code if error.response is not None else "unknown"
+        hints = {
+            401: "Check the API token.",
+            403: "Check the token permissions and model access.",
+            404: "Check the API base URL and exact model ID.",
+            400: "Check model parameters. Try disabling JSON mode if unsupported.",
+            429: "The service limit was reached. Wait before retrying.",
+        }
+        return f"Analysis failed: HTTP {status}. {hints.get(status, 'Check service availability.')}"
+    if isinstance(error, requests.Timeout):
+        return "Analysis timed out. Try a shorter article or retry later."
+    if isinstance(error, requests.RequestException):
+        return "Connection failed. Check that the selected service is running and reachable."
+    return "The model returned an incomplete or invalid response. No new analysis was saved."
+
+
+def run_model(provider, model_name, base_url, api_token, article_fields, json_mode):
+    if not model_name.strip():
+        raise ValueError("Missing model ID")
+    messages = [
+        {"role": "system", "content": INSTRUCTIONS},
+        {"role": "user", "content": json.dumps(article_fields, ensure_ascii=False)},
+    ]
+    payload = {"model": model_name, "messages": messages, "stream": False}
+    headers = {}
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("Invalid API base URL")
+    if not api_token:
+        raise ValueError("Missing API token")
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {api_token}"}
+    payload["temperature"] = 0
+    payload["response_format"] = {"type": "json_object"}
+    started = time.perf_counter()
+    # Disable redirects so an authentication header is not sent to another URL.
+    response = requests.post(url, headers=headers, json=payload, timeout=(15, 300), allow_redirects=False)
+    response.raise_for_status()
+    if 300 <= response.status_code < 400:
+        raise ValueError("Unexpected redirect")
+    data = response.json()
+    choice = data["choices"][0]
+    if choice.get("finish_reason") not in (None, "stop"):
+        raise ValueError("Incomplete output")
+    content = choice["message"]["content"]
+    if not isinstance(content, str):
+        raise ValueError("Missing response content")
+    # Some backends wrap JSON in a Markdown fence.
+    content = content.strip()
+    if content.startswith("```"):
+        lines = content.splitlines()
+        if lines[-1].strip() == "```":
+            content = "\n".join(lines[1:-1])
+    result = json.loads(content)
+    return result, {
+        "provider": provider,
+        "elapsed_seconds": round(time.perf_counter() - started, 2),
+        "generation_settings": {"temperature": 0, "json_mode": True},
+    }
+
+
 st.set_page_config(
     page_title="Women's Expert Voices",
     layout="wide",
@@ -214,9 +280,35 @@ st.set_page_config(
 
 st.title("Women's Expert Voices")
 st.caption(
-    "Development prototype for Spanish technology news. "
+    "Version 2 — gpt-oss-120b on OVH. "
     "Automatic predictions require human review."
 )
+
+provider = "Organisers' OVH API"
+model_name = "gpt-oss-120b"
+json_mode = True
+
+with st.sidebar:
+    st.header("Version 2 — OVH")
+    st.write("Model: gpt-oss-120b")
+    base_url = st.text_input(
+        "API base URL (ending in /v1)",
+        value=os.environ.get(
+            "OVH_AI_BASE_URL",
+            "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+        ),
+    ).strip()
+    api_token = os.environ.get("OVH_AI_ENDPOINTS_ACCESS_TOKEN", "").strip()
+    if not api_token:
+        api_token = st.text_input("API token", type="password").strip()
+    else:
+        st.caption("API token loaded from the environment.")
+    st.caption(
+        "Articles are sent to OVH for analysis. "
+        "The token is not included in downloaded results."
+    )
+    if not api_token:
+        st.info("Enter your team token before analysing.")
 
 with st.form("article_form"):
     title = st.text_input("Article headline")
@@ -231,7 +323,9 @@ with st.form("article_form"):
     )
 
 if analyse:
-    if not body.strip():
+    if not api_token or not model_name or not base_url:
+        st.warning("Enter the API base URL, model ID and token in the sidebar.")
+    elif not body.strip():
         st.warning("Please enter the article body.")
     else:
         article_fields = {
@@ -241,35 +335,11 @@ if analyse:
         }
         source_text = "\n\n".join(article_fields.values())
 
-        with st.spinner("Analysing with your local model..."):
+        with st.spinner(f"Analysing with {model_name}..."):
             try:
-                response = requests.post(
-                    OLLAMA_URL,
-                    json={
-                        "model": MODEL,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": INSTRUCTIONS,
-                            },
-                            {
-                                "role": "user",
-                                "content": json.dumps(
-                                    article_fields,
-                                    ensure_ascii=False,
-                                ),
-                            },
-                        ],
-                        "format": "json",
-                        "stream": False,
-                        "options": {"temperature": 0},
-                    },
-                    timeout=300,
-                )
-                response.raise_for_status()
-
-                result = json.loads(
-                    response.json()["message"]["content"]
+                result, run_metadata = run_model(
+                    provider, model_name, base_url, api_token,
+                    article_fields, json_mode,
                 )
                 validate_prediction(result)
 
@@ -279,7 +349,9 @@ if analyse:
                     "created_at": datetime.now(
                         timezone.utc
                     ).isoformat(),
-                    "model": MODEL,
+                    "model": model_name,
+                    "app_version": APP_VERSION,
+                    **run_metadata,
                     "prompt_version": PROMPT_VERSION,
                     "prompt": INSTRUCTIONS,
                     "article": article_fields,
@@ -300,8 +372,9 @@ if analyse:
                 ValueError,
                 KeyError,
                 TypeError,
+                IndexError,
             ) as error:
-                st.error(f"Analysis failed: {error}")
+                st.error(safe_error(error))
 
                 if "analysis" in st.session_state:
                     st.info(
@@ -314,6 +387,7 @@ if "analysis" in st.session_state:
 
     st.divider()
     st.subheader("Last successfully analysed article")
+    st.caption(f"Provider: {analysis.get('provider', 'OVH')} | Model: {analysis['model']}")
 
     with st.expander("View the analysed article"):
         for section, content in analysis["article"].items():
@@ -399,7 +473,7 @@ if "analysis" in st.session_state:
 
     export_name = st.text_input(
         "Export filename",
-        value="development_case_02.json",
+        value="development_v2_gpt_oss_120b.json",
         key=f"export_name_{version}",
     )
 
