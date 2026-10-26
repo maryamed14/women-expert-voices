@@ -45,3 +45,28 @@ Current limitations
 - The current model connection uses local Ollama only.
 - The full team metrics and independent evaluation remain under development.
 Do not commit credentials or copyrighted article collections without checking permissions.
+
+
+
+## Version 2 — OVH gpt-oss-120b
+
+The `v2` branch uses the organisers’ OVH API with gpt-oss-120b.
+The local Ollama version remains on `main`.
+
+To try v2:
+
+```powershell
+git fetch origin
+git switch v2
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+Enter the organisers’ API base URL (ending in `/v1`) and team token
+in the sidebar. Ollama is not required for v2.
+
+Never put the token in the code or commit it to GitHub.
+Articles are sent to OVH for analysis. Human review is still required.
+
+To return to the local version, stop Streamlit, run
+`git switch main`, then restart the app.
